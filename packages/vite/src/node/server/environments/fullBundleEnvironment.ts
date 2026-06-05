@@ -71,6 +71,10 @@ export class FullBundleDevEnvironment extends DevEnvironment {
     this.logger.info(colors.green(`page reload`), { timestamp: true })
   })
 
+  private fullReloadPending = false
+
+  private lastBuildError: Error | null = null
+
   memoryFiles: MemoryFiles = new MemoryFiles()
 
   constructor(
@@ -106,8 +110,16 @@ export class FullBundleDevEnvironment extends DevEnvironment {
     )!
 
     this.hot.on('vite:module-loaded', (payload, client) => {
-      this.clients.setupIfNeeded(client, payload.clientId)
+      const isNew = this.clients.setupIfNeeded(client, payload.clientId)
       this.devEngine.registerModules(payload.clientId, payload.modules)
+
+      // Replay the cached build error to fresh connections
+      if (isNew && this.lastBuildError) {
+        client.send({
+          type: 'error',
+          err: prepareError(this.lastBuildError),
+        })
+      }
     })
     this.hot.on('vite:client:disconnect', (_payload, client) => {
       const clientId = this.clients.delete(client)
@@ -149,12 +161,15 @@ export class FullBundleDevEnvironment extends DevEnvironment {
           this.logger.error(colors.red(`✘ Build error: ${result.message}`), {
             error: result,
           })
+          this.lastBuildError = result
           this.hot.send({
             type: 'error',
             err: prepareError(result),
           })
           return
         }
+        // Rebuild succeeded → bundle is fresh, no error condition remains.
+        this.lastBuildError = null
 
         // NOTE: don't clear memoryFiles here as incremental build reuses the files
         for (const outputFile of result.output) {
@@ -166,6 +181,12 @@ export class FullBundleDevEnvironment extends DevEnvironment {
               etag: getEtag(Buffer.from(source), { weak: true }),
             }
           })
+        }
+
+        // Trigger a full reload if there's no error in the result and a reload is pending from HMR.
+        if (this.fullReloadPending) {
+          this.fullReloadPending = false
+          this.debouncedFullReload()
         }
       },
       watch: {
@@ -262,7 +283,7 @@ export class FullBundleDevEnvironment extends DevEnvironment {
     const bundleState = await this.devEngine.getBundleState()
     const shouldTrigger =
       bundleState.hasStaleOutput &&
-      !bundleState.lastFullBuildFailed &&
+      !bundleState.lastBuildErrored &&
       this.initialBuildCompleted
     if (shouldTrigger) {
       this.devEngine.ensureLatestBuildOutput().then(() => {
@@ -349,9 +370,16 @@ export class FullBundleDevEnvironment extends DevEnvironment {
         colors.green(`trigger page reload `) + colors.dim(shortFile) + reason,
         { clear: !invalidateInformation, timestamp: true },
       )
-      this.devEngine.ensureLatestBuildOutput().then(() => {
-        this.debouncedFullReload()
-      })
+      if (invalidateInformation) {
+        // Invalidate does not get upgraded to `rebuild`,
+        // so `onOutput` will not be triggered and thus the reload needs to be triggered here.
+        this.devEngine.ensureLatestBuildOutput().then(async () => {
+          this.debouncedFullReload()
+        })
+      } else {
+        // Use a flag to defer the reload until the `onOutput` callback to avoid error lay flashes.
+        this.fullReloadPending = true
+      }
       return
     }
 
@@ -403,15 +431,20 @@ class Clients {
   private clientToId = new Map<NormalizedHotChannelClient, string>()
   private idToClient = new Map<string, NormalizedHotChannelClient>()
 
-  setupIfNeeded(client: NormalizedHotChannelClient, clientId: string) {
+  /** Returns `true` if this is the first time this client/id has been
+   *  registered (caller uses this to e.g. replay cached errors on
+   *  first connect / after a browser refresh reconnect). */
+  setupIfNeeded(client: NormalizedHotChannelClient, clientId: string): boolean {
     const id = this.clientToId.get(client)
     if (id && id !== clientId) {
       throw new Error(
         'client ID conflict detected. Please restart the dev server.',
       )
     }
+    const isNew = !this.idToClient.has(clientId)
     this.clientToId.set(client, clientId)
     this.idToClient.set(clientId, client)
+    return isNew
   }
 
   get(id: string): NormalizedHotChannelClient | undefined {
